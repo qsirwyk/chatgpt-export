@@ -16,6 +16,8 @@ import {
   ATTR_UNIT,
   captureTurns,
   findConversationDom,
+  boxOf,
+  domDiagnostics,
   type ConversationDom,
   type Turn,
 } from './capture';
@@ -70,7 +72,7 @@ export function startSelectionMode(): number {
     return active.turnCount;
   }
   const dom = findConversationDom();
-  if (!dom || dom.turns.length === 0) throw new Error('页面上没有找到对话内容，请等待对话加载完成后重试。');
+  if (!dom || dom.turns.length === 0) throw new Error(`页面上没有找到对话节点，请等待对话加载完成后重试。（${domDiagnostics()}）`);
   active = new SelectionMode(dom);
   return active.turnCount;
 }
@@ -247,7 +249,7 @@ class SelectionMode {
     for (const { unit } of this.dom.turns) {
       const check = this.checks.get(unit);
       if (!check) continue;
-      const rect = unit.getBoundingClientRect();
+      const rect = boxOf(unit).getBoundingClientRect();
       const msg = unit.querySelector('[data-message-author-role]')?.getBoundingClientRect();
       const visible = rect.bottom > 0 && rect.top < innerHeight && rect.height > 0;
       check.style.display = visible ? '' : 'none';

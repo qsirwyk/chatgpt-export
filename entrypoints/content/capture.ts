@@ -55,6 +55,34 @@ function commonAncestor(elements: HTMLElement[]): HTMLElement | null {
   return node;
 }
 
+/**
+ * 轮次实际占据布局的节点：外层容器若是 display: contents（自身没有盒子，无法测量、滚动和截图），
+ * 就向下找到第一个真正渲染的子节点。
+ */
+export function boxOf(unit: HTMLElement): HTMLElement {
+  let node = unit;
+  while (getComputedStyle(node).display === 'contents') {
+    const child = [...node.children].find(
+      (c): c is HTMLElement => c instanceof HTMLElement && (c.getClientRects().length > 0 || getComputedStyle(c).display === 'contents'),
+    );
+    if (!child) break;
+    node = child;
+  }
+  return node;
+}
+
+/** 页面结构诊断信息：找不到对话节点时附在错误提示里 */
+export function domDiagnostics(): string {
+  const count = (sel: string) => document.querySelectorAll(sel).length;
+  return [
+    `data-turn-id-container=${count('[data-turn-id-container]')}`,
+    `conversation-turn=${count('[data-testid^="conversation-turn-"]')}`,
+    `data-turn=${count('[data-turn]')}`,
+    `author-role=${count('[data-message-author-role]')}`,
+    `article=${count('article')}`,
+  ].join(', ');
+}
+
 /** 当前已渲染内容中的角色；未渲染（虚拟列表占位）时为 unknown */
 function readRole(unit: HTMLElement): Role {
   const attr =
@@ -94,7 +122,8 @@ export function findConversationDom(): ConversationDom | null {
   let anchors = outermost([...document.querySelectorAll<HTMLElement>('[data-turn-id-container]')]);
   // 旧版页面：article / section[data-testid^="conversation-turn-"]，或按消息节点兜底
   if (anchors.length === 0) anchors = outermost([...document.querySelectorAll<HTMLElement>(TURN_CONTENT_SELECTOR)]);
-  anchors = anchors.filter((el) => el.isConnected && el.getClientRects().length > 0);
+  // 注意：不能按 getClientRects() 过滤——外层容器可能是 display: contents，本身没有盒子
+  anchors = anchors.filter((el) => el.isConnected && !el.closest('cge-image-export'));
   if (anchors.length === 0) return null;
 
   const root = commonAncestor(anchors);
@@ -134,7 +163,7 @@ function isRendered(unit: HTMLElement): boolean {
 
 /** 把轮次滚动到视口并等待 ChatGPT 渲染出内容、图片加载完成、高度稳定 */
 async function ensureRendered(unit: HTMLElement): Promise<void> {
-  unit.scrollIntoView({ block: 'start', behavior: 'instant' as ScrollBehavior });
+  boxOf(unit).scrollIntoView({ block: 'start', behavior: 'instant' as ScrollBehavior });
   const deadline = Date.now() + RENDER_TIMEOUT;
   while (!isRendered(unit) && Date.now() < deadline) await sleep(50);
 
@@ -149,7 +178,7 @@ async function ensureRendered(unit: HTMLElement): Promise<void> {
   let last = -1;
   for (let i = 0; i < 20; i++) {
     await nextFrame();
-    const h = unit.getBoundingClientRect().height;
+    const h = boxOf(unit).getBoundingClientRect().height;
     if (h === last) break;
     last = h;
   }
@@ -166,6 +195,7 @@ function collectActionBars(unit: HTMLElement): Set<Node> {
     while (
       node.parentElement &&
       node.parentElement !== unit &&
+      node.parentElement !== boxOf(unit) &&
       !node.parentElement.textContent?.trim() &&
       !node.parentElement.querySelector('img, video, canvas, [data-message-author-role]')
     ) {
@@ -199,7 +229,7 @@ async function fetchViaBackground(url: string): Promise<string | false> {
 
 /** 轮次中消息内容的水平范围（相对轮次节点左侧），用于裁剪两侧空白 */
 function contentRange(unit: HTMLElement, exclude: Set<Node>): { left: number; right: number } | null {
-  const base = unit.getBoundingClientRect();
+  const base = boxOf(unit).getBoundingClientRect();
   let left = Infinity;
   let right = -Infinity;
   const targets = unit.querySelectorAll<HTMLElement>('[data-message-author-role]');
@@ -324,16 +354,17 @@ export async function captureTurns(
     for (const [i, unit] of units.entries()) {
       onProgress(`正在截取第 ${i + 1}/${units.length} 轮…`);
       await ensureRendered(unit);
-      const rect = unit.getBoundingClientRect();
+      const box = boxOf(unit);
+      const rect = box.getBoundingClientRect();
       const index = order.get(unit) ?? -1;
       // 与上一轮在页面中相邻时沿用真实间距；中间隔着未选中的轮次时不留额外空隙
       const prev = index === prevIndex + 1 ? dom.turns[index - 1]?.unit : undefined;
-      const gapBefore = prev ? Math.min(Math.max(0, rect.top - prev.getBoundingClientRect().bottom), 48) : 0;
+      const gapBefore = prev ? Math.min(Math.max(0, rect.top - boxOf(prev).getBoundingClientRect().bottom), 48) : 0;
       prevIndex = index;
 
       const actionBars = options.hideActions ? collectActionBars(unit) : new Set<Node>();
       const scale = Math.min(options.scale, MAX_CANVAS_PX / Math.max(1, rect.height));
-      const canvas = await domToCanvas(unit, {
+      const canvas = await domToCanvas(box, {
         scale,
         backgroundColor: background,
         filter: (node) => !actionBars.has(node),

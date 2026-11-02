@@ -62,7 +62,8 @@ async function init() {
     const info = await sendToTab<PingResult>({ type: 'CGE_PING' });
     // Markdown 需要对话 ID 调接口；图片只要页面上有对话节点即可（也支持分享页）
     canExportMd = !!info.conversationId;
-    canExportImage = info.turnCount > 0;
+    // 对话页上总是允许点击：识别失败时由页面返回具体原因，而不是静默禁用按钮
+    canExportImage = info.turnCount > 0 || canExportMd;
     if (!canExportMd && !canExportImage) {
       targetEl.textContent = '请先打开一个具体的对话。';
       return;
