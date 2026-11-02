@@ -19,14 +19,28 @@
       </button>
       <button id="btn-img" class="btn" disabled>
         <span class="btn-title">导出图片</span>
-        <span class="btn-sub">按页面原样截图，可勾选要导出的消息</span>
+        <span class="btn-sub">滚动整段对话，按页面原样截成长图</span>
       </button>
     </div>
 
-    <label class="option">
-      <input type="checkbox" id="opt-embed" checked />
-      <span>Markdown 中以 base64 内嵌对话图片</span>
-    </label>
+    <fieldset class="options">
+      <legend>Markdown</legend>
+      <label class="option">
+        <input type="checkbox" id="opt-embed" checked />
+        <span>以 base64 内嵌对话图片</span>
+      </label>
+    </fieldset>
+    <fieldset class="options">
+      <legend>图片</legend>
+      <label class="option">
+        <input type="checkbox" id="opt-hide-actions" checked />
+        <span>隐藏复制、点赞等操作按钮</span>
+      </label>
+      <label class="option">
+        <input type="checkbox" id="opt-crop-sides" checked />
+        <span>裁剪两侧空白</span>
+      </label>
+    </fieldset>
 
     <p id="status" class="status" role="status"></p>
 

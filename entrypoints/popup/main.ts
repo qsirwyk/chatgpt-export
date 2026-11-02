@@ -1,9 +1,14 @@
 import './style.css';
 import { browser } from 'wxt/browser';
 import {
+  DEFAULT_IMAGE_OPTIONS,
   EMBED_IMAGES_KEY,
+  IMAGE_OPTIONS_KEY,
+  type BackgroundRequest,
   type ContentRequest,
+  type ExportImageResult,
   type ExportMarkdownResult,
+  type ImageOptions,
   type MessageResponse,
   type PingResult,
 } from '@/utils/types';
@@ -16,6 +21,8 @@ const statusEl = $('status');
 const btnMd = $<HTMLButtonElement>('btn-md');
 const btnImg = $<HTMLButtonElement>('btn-img');
 const optEmbed = $<HTMLInputElement>('opt-embed');
+const optHideActions = $<HTMLInputElement>('opt-hide-actions');
+const optCropSides = $<HTMLInputElement>('opt-crop-sides');
 
 let tabId: number | null = null;
 
@@ -52,6 +59,16 @@ async function init() {
   optEmbed.checked = stored[EMBED_IMAGES_KEY] !== false;
   optEmbed.addEventListener('change', () => browser.storage.local.set({ [EMBED_IMAGES_KEY]: optEmbed.checked }));
 
+  const imageOptions = {
+    ...DEFAULT_IMAGE_OPTIONS,
+    ...((await browser.storage.local.get(IMAGE_OPTIONS_KEY))[IMAGE_OPTIONS_KEY] as Partial<ImageOptions> | undefined),
+  };
+  optHideActions.checked = imageOptions.hideActions;
+  optCropSides.checked = imageOptions.cropSides;
+  for (const el of [optHideActions, optCropSides]) {
+    el.addEventListener('change', () => browser.storage.local.set({ [IMAGE_OPTIONS_KEY]: readImageOptions() }));
+  }
+
   const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id || !CHATGPT_URL.test(tab.url || '')) {
     targetEl.textContent = '请在 chatgpt.com 的对话页面中使用。';
@@ -60,9 +77,9 @@ async function init() {
   tabId = tab.id;
   try {
     const info = await sendToTab<PingResult>({ type: 'CGE_PING' });
-    // Markdown 需要对话 ID 调接口；图片只要页面上有对话节点即可（也支持分享页）
+    // Markdown 需要对话 ID 调接口；图片只要页面上有对话即可（也支持分享页）。
+    // 对话页上总是允许点击图片导出：识别失败时由页面返回具体原因，而不是静默禁用按钮
     canExportMd = !!info.conversationId;
-    // 对话页上总是允许点击：识别失败时由页面返回具体原因，而不是静默禁用按钮
     canExportImage = info.turnCount > 0 || canExportMd;
     if (!canExportMd && !canExportImage) {
       targetEl.textContent = '请先打开一个具体的对话。';
@@ -91,16 +108,31 @@ btnMd.addEventListener('click', async () => {
   }
 });
 
+function readImageOptions(): ImageOptions {
+  return { hideActions: optHideActions.checked, cropSides: optCropSides.checked };
+}
+
 btnImg.addEventListener('click', async () => {
   setBusy(true);
+  setStatus('正在截图，期间请不要切换标签页或滚动页面（按 Esc 取消）…');
   try {
-    // 在页面中进入选择模式（勾选消息 + 底部工具栏），弹窗随即关闭
-    await sendToTab<number>({ type: 'CGE_START_IMAGE_MODE' });
-    window.close();
+    const result = await sendToTab<ExportImageResult>({ type: 'CGE_EXPORT_IMAGE', options: readImageOptions() });
+    const n = result.files.length;
+    setStatus(
+      n > 1
+        ? `已导出 ${result.turnCount} 轮，较长，切分为 ${n} 张图片保存到「下载/ChatGPT」。`
+        : `已导出 ${result.turnCount} 轮，保存到「下载/ChatGPT」。`,
+    );
   } catch (err) {
     setStatus((err as Error).message, true);
+  } finally {
     setBusy(false);
   }
+});
+
+// 截图进度（内容脚本广播）
+browser.runtime.onMessage.addListener((message: BackgroundRequest, sender) => {
+  if (message?.type === 'CGE_PROGRESS' && message.text && sender.tab?.id === tabId) setStatus(message.text);
 });
 
 init();

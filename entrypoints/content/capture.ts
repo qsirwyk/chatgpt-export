@@ -1,61 +1,48 @@
-// 直接基于 ChatGPT 页面自身的 DOM 生成图片：不重新排版，截图结果与页面显示一致。
-//
-// ChatGPT 的对话列表是虚拟滚动的，且有两种形态：
-// - 2026 版：滑动窗口，只挂载视口附近的约 7 轮（div[data-turn-key]），窗口外的轮次连占位节点都没有；
-//   滚动到顶部时还会懒加载更早的历史并重新分组。
-// - 2025 版：每轮都有占位容器 div[data-turn-id-container]，只在视口附近渲染内容。
-// 因此导出流程是：先滚到顶部加载完整历史 → 自上而下逐屏滚动，按消息 ID 去重，
-// 截取每个选中轮次的真实 DOM（截完立即压缩成 PNG 释放内存）→ 最后按顺序拼接成长图（超过上限时切分）。
-import { domToCanvas } from 'modern-screenshot';
+// 滚动截图：先把整段对话的历史加载完，再从上到下逐屏滚动，用 captureVisibleTab 截取浏览器真实画出的像素，
+// 按滚动距离拼接成长图。截到的就是页面本身，不做任何重新排版或 DOM 克隆。
 import { browser } from 'wxt/browser';
 import type { BackgroundRequest, ImageOptions, MessageResponse } from '@/utils/types';
 
 /** Chrome 单个 canvas 边长上限约 32767px，留出余量 */
 const MAX_CANVAS_PX = 30000;
-/** 裁剪两侧空白时，内容列左右保留的边距（CSS px） */
-const CROP_MARGIN = 28;
+/** 裁剪两侧空白时，对话内容左右保留的边距（CSS px） */
+const SIDE_MARGIN = 28;
 /** 图片上下留白（CSS px） */
-const EDGE_PADDING = 16;
-/** 等待单个轮次渲染完成的最长时间 */
-const RENDER_TIMEOUT = 6000;
+const EDGE_PADDING = 24;
 
-export const ATTR_UNIT = 'data-cge-unit';
-export const ATTR_EXCLUDED = 'data-cge-excluded';
-export const ATTR_CAPTURING = 'data-cge-capturing';
+const ATTR_CAPTURING = 'data-cge-capturing';
+const ATTR_HIDE = 'data-cge-hide';
+const ATTR_SCROLLER = 'data-cge-scroller';
+const ATTR_HIDE_ACTIONS = 'data-cge-hide-actions';
 
-export type Role = 'user' | 'assistant' | 'unknown';
-
-export interface Turn {
-  /**
-   * 稳定标识（data-turn-key / data-turn-id-container 的值）。ChatGPT 懒加载历史或重新渲染列表时
-   * 会替换、复用占位节点，节点引用不可靠，选择状态和截图都按 id 重新定位。
-   */
-  id: string;
-  /** 该轮次包含的消息 ID（m:<id>）；分组变化时用来去重。旧版未渲染的占位节点为空 */
-  messageIds: string[];
-  /** 轮次在公共容器下的直接子节点（虚拟列表的占位容器），截图与选择都以它为单位 */
-  unit: HTMLElement;
-  role: Role;
+const CAPTURE_STYLE = `
+html[${ATTR_CAPTURING}] [${ATTR_HIDE}] { visibility: hidden !important; }
+html[${ATTR_CAPTURING}] [${ATTR_SCROLLER}] {
+  scrollbar-width: none !important; scroll-behavior: auto !important; overflow-anchor: none !important;
+  pointer-events: none !important;
 }
-
-export interface ConversationDom {
-  /** 所有轮次的公共父节点 */
-  root: HTMLElement;
-  turns: Turn[];
+html[${ATTR_CAPTURING}] [${ATTR_SCROLLER}]::-webkit-scrollbar { display: none !important; }
+html[${ATTR_CAPTURING}] *, html[${ATTR_CAPTURING}] *::before, html[${ATTR_CAPTURING}] *::after {
+  transition: none !important; caret-color: transparent !important;
 }
+html[${ATTR_CAPTURING}][${ATTR_HIDE_ACTIONS}] :is(.turn-action-controls, [data-testid$="turn-action-button"]) {
+  visibility: hidden !important;
+}
+`;
 
-// ---------- 查找对话节点 ----------
+/** 每轮对话的锚点，按页面版本依次尝试 */
+const ANCHOR_SELECTORS = [
+  '[data-turn-key]', // 2026 版：一问一答为一轮
+  '[data-turn-id-container]', // 2025 版
+  '[data-testid^="conversation-turn-"]',
+  '[data-message-author-role]',
+];
 
-/**
- * 轮次锚点，按优先级尝试：
- * - 2026 版：div[data-turn-key]（一问一答为一轮，外层是虚拟列表的定高占位 div）
- * - 2025 版：div[data-turn-id-container] / section[data-testid="conversation-turn-N"]
- */
-const ANCHOR_SELECTORS = ['[data-turn-key]', '[data-turn-id-container]'];
-const TURN_CONTENT_SELECTOR =
-  '[data-turn-key], [data-testid^="conversation-turn-"], [data-message-author-role], [data-content-search-unit-key]';
-/** 单条消息（用户气泡 / 助手回复）的节点 */
-const MESSAGE_SELECTOR = '[data-message-author-role], [data-content-search-unit-key]';
+/** 用来确定对话列宽度的消息节点 */
+const MESSAGE_SELECTOR =
+  '[data-message-author-role], [data-content-search-unit-key], [data-markdown-text-style], [data-user-message-bubble]';
+
+// ---------- 页面结构 ----------
 
 function outermost(elements: HTMLElement[]): HTMLElement[] {
   const set = new Set(elements);
@@ -65,171 +52,50 @@ function outermost(elements: HTMLElement[]): HTMLElement[] {
   });
 }
 
-function commonAncestor(elements: HTMLElement[]): HTMLElement | null {
-  const [first, ...rest] = elements;
-  if (!first) return null;
-  let node: HTMLElement | null = rest.length === 0 ? first.parentElement : first;
-  while (node && !rest.every((el) => node!.contains(el))) node = node.parentElement;
-  return node;
-}
+/** 查找范围：截图期间限定在选中的滚动容器内 */
+let scope: ParentNode = document;
 
 /**
- * 轮次实际占据布局的节点：外层容器若是 display: contents（自身没有盒子，无法测量、滚动和截图），
- * 就向下找到第一个真正渲染的子节点。
+ * 是否真的显示在页面上。ChatGPT 会在 DOM 中保留隐藏的对话副本（高度为 0），必须排除。
+ * display: contents 的节点自身没有盒子，看它的子节点。
  */
-export function boxOf(unit: HTMLElement): HTMLElement {
-  let node = unit;
-  while (getComputedStyle(node).display === 'contents') {
-    const child = [...node.children].find(
-      (c): c is HTMLElement => c instanceof HTMLElement && (c.getClientRects().length > 0 || getComputedStyle(c).display === 'contents'),
-    );
-    if (!child) break;
-    node = child;
+function isVisible(el: HTMLElement): boolean {
+  if (el.checkVisibility()) return true;
+  return getComputedStyle(el).display === 'contents' && [...el.children].some((c) => c.checkVisibility());
+}
+
+function findAnchors(): HTMLElement[] {
+  for (const sel of ANCHOR_SELECTORS) {
+    const found = outermost([...scope.querySelectorAll<HTMLElement>(sel)].filter(isVisible));
+    if (found.length) return found;
   }
-  return node;
+  return [];
+}
+
+export function countTurns(): number {
+  return findAnchors().length;
 }
 
 /** 页面结构诊断信息：找不到对话节点时附在错误提示里 */
-export function domDiagnostics(): string {
+function domDiagnostics(): string {
   const count = (sel: string) => document.querySelectorAll(sel).length;
-  return [
-    `data-turn-id-container=${count('[data-turn-id-container]')}`,
-    `data-turn-key=${count('[data-turn-key]')}`,
-    `conversation-role=${count('[data-conversation-role]')}`,
-    `conversation-turn=${count('[data-testid^="conversation-turn-"]')}`,
-    `data-turn=${count('[data-turn]')}`,
-    `author-role=${count('[data-message-author-role]')}`,
-    `article=${count('article')}`,
-  ].join(', ');
+  return ['[data-turn-key]', '[data-conversation-role]', '[data-turn-id-container]', '[data-message-author-role]']
+    .map((sel) => `${sel.slice(1, -1)}=${count(sel)}`)
+    .join(', ');
 }
 
-/** 当前已渲染内容中的角色；未渲染（虚拟列表占位）时为 unknown */
-function readRole(unit: HTMLElement): Role {
-  const attr =
-    unit.querySelector('[data-turn]')?.getAttribute('data-turn') ||
-    unit.getAttribute('data-turn') ||
-    unit.querySelector('[data-message-author-role]')?.getAttribute('data-message-author-role') ||
-    unit.querySelector('[data-conversation-role]')?.getAttribute('data-conversation-role');
-  return attr === 'user' || attr === 'assistant' ? attr : 'unknown';
-}
-
-
-/** 从当前渲染的内容中读取轮次 id；内容被虚拟列表卸载时返回 null */
-function liveIdOf(unit: HTMLElement): string | null {
-  const key = unit.closest('[data-turn-key]') ?? unit.querySelector('[data-turn-key]');
-  if (key) return `k:${key.getAttribute('data-turn-key')}`;
-  const container = unit.matches('[data-turn-id-container]') ? unit : unit.querySelector('[data-turn-id-container]');
-  if (container) return `c:${container.getAttribute('data-turn-id-container')}`;
-  return null;
-}
-
-/** 轮次中所有消息的 ID（新版的 data-chatgpt-search-message-ids 等，旧版的 data-message-id） */
-function messageIdsOf(unit: HTMLElement): string[] {
-  const ids = new Set<string>();
-  const add = (value: string | null) => value?.split(/[\s,]+/).forEach((v) => v && ids.add(`m:${v}`));
-  unit.querySelectorAll('[data-chatgpt-search-message-ids]').forEach((el) => add(el.getAttribute('data-chatgpt-search-message-ids')));
-  unit.querySelectorAll('[data-chatgpt-selection-message-id]').forEach((el) => add(el.getAttribute('data-chatgpt-selection-message-id')));
-  unit.querySelectorAll('[data-message-id]').forEach((el) => add(el.getAttribute('data-message-id')));
-  return [...ids];
-}
-
-/** 轮次的所有标识：选择状态与去重都基于它们 */
-export function keysOf(turn: Turn): string[] {
-  return [turn.id, ...turn.messageIds];
-}
-
-export interface TurnSelection {
-  /** all：全部轮次，marked 为排除项；only：只导出 marked 中的轮次 */
-  mode: 'all' | 'only';
-  /** 轮次 id → 该轮次的全部标识（keysOf） */
-  marked: Map<string, string[]>;
-}
-
-export function isSelected(turn: Turn, selection: TurnSelection): boolean {
-  const keys = new Set(keysOf(turn));
-  let hit = false;
-  for (const group of selection.marked.values()) if (group.some((k) => keys.has(k))) hit = true;
-  return selection.mode === 'all' ? !hit : hit;
-}
-
-const knownIds = new WeakMap<HTMLElement, string>();
-let fallbackSeq = 0;
-
-function idOf(unit: HTMLElement): string {
-  const live = liveIdOf(unit);
-  if (live) knownIds.set(unit, live);
-  else if (!knownIds.has(unit)) knownIds.set(unit, `n:${++fallbackSeq}`);
-  return knownIds.get(unit)!;
-}
-
-/** 记住已经看到过的角色：轮次滚出视口被卸载后仍然可用 */
-const knownRoles = new WeakMap<HTMLElement, Role>();
-
-function roleOf(unit: HTMLElement): Role {
-  const role = readRole(unit);
-  if (role !== 'unknown') knownRoles.set(unit, role);
-  return knownRoles.get(unit) ?? role;
-}
-
-/** 未知角色按 user / assistant 交替规律，从最近的已知轮次推断 */
-function inferRoles(turns: Turn[]) {
-  turns.forEach((t, i) => {
-    if (t.role !== 'unknown') return;
-    for (let d = 1; d < turns.length; d++) {
-      for (const j of [i - d, i + d]) {
-        const known = turns[j]?.role;
-        if (known && known !== 'unknown') {
-          t.role = d % 2 === 0 ? known : known === 'user' ? 'assistant' : 'user';
-          return;
-        }
-      }
-    }
-  });
-}
-
-export function findConversationDom(): ConversationDom | null {
-  let anchors: HTMLElement[] = [];
-  for (const sel of ANCHOR_SELECTORS) {
-    anchors = outermost([...document.querySelectorAll<HTMLElement>(sel)]);
-    if (anchors.length > 0) break;
+/** 对话列表的滚动容器 */
+function scrollerOf(el: HTMLElement): HTMLElement {
+  // 优先选内容超出可见区域的滚动容器；对话很短、一屏放得下时退而选最近的可滚动容器
+  let fallback: HTMLElement | null = null;
+  for (let node: HTMLElement | null = el.parentElement; node; node = node.parentElement) {
+    const { overflowY } = getComputedStyle(node);
+    if (!/(auto|scroll|overlay)/.test(overflowY) || node.clientHeight === 0) continue;
+    if (node.scrollHeight > node.clientHeight) return node;
+    fallback ??= node;
   }
-  // 旧版页面：article / section[data-testid^="conversation-turn-"]，或按消息节点兜底
-  if (anchors.length === 0) anchors = outermost([...document.querySelectorAll<HTMLElement>(TURN_CONTENT_SELECTOR)]);
-  // 注意：不能按 getClientRects() 过滤——外层容器可能是 display: contents，本身没有盒子
-  anchors = anchors.filter((el) => el.isConnected && !el.closest('cge-image-export'));
-  if (anchors.length === 0) return null;
-
-  const root = commonAncestor(anchors);
-  if (!root) return null;
-  const found = new Set<HTMLElement>();
-  for (const anchor of anchors) {
-    let unit = anchor;
-    while (unit.parentElement && unit.parentElement !== root) unit = unit.parentElement;
-    found.add(unit);
-  }
-  const turns: Turn[] = [];
-  const byId = new Map<string, Turn>();
-  for (const child of root.children) {
-    if (!(child instanceof HTMLElement) || !found.has(child)) continue;
-    const turn: Turn = { id: idOf(child), messageIds: messageIdsOf(child), unit: child, role: roleOf(child) };
-    const dup = byId.get(turn.id);
-    if (dup) {
-      // 同一 id 出现两次：缓存的旧 id 已过时，保留内容真正属于该轮次的节点
-      if (liveIdOf(child) !== turn.id) continue;
-      turns.splice(turns.indexOf(dup), 1);
-    }
-    byId.set(turn.id, turn);
-    child.setAttribute(ATTR_UNIT, '');
-    turns.push(turn);
-  }
-  inferRoles(turns);
-  return { root, turns };
+  return fallback ?? (document.scrollingElement as HTMLElement | null) ?? document.documentElement;
 }
-
-// ---------- 截图辅助 ----------
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r(null)));
 
 /** 向上找到第一个不透明的背景色，作为图片底色 */
 function backgroundColorOf(el: HTMLElement): string {
@@ -240,103 +106,107 @@ function backgroundColorOf(el: HTMLElement): string {
   return getComputedStyle(document.body).backgroundColor || '#ffffff';
 }
 
-function isRendered(unit: HTMLElement): boolean {
-  const content = unit.querySelector<HTMLElement>(TURN_CONTENT_SELECTOR) ?? unit;
-  return content.getBoundingClientRect().height > 0 && !!(content.textContent?.trim() || content.querySelector('img'));
-}
-
-/** 把轮次滚动到视口并等待 ChatGPT 渲染出内容、图片加载完成、高度稳定 */
-async function ensureRendered(unit: HTMLElement): Promise<void> {
-  boxOf(unit).scrollIntoView({ block: 'start', behavior: 'instant' as ScrollBehavior });
-  const deadline = Date.now() + RENDER_TIMEOUT;
-  while (!isRendered(unit) && Date.now() < deadline) await sleep(50);
-
-  const images = [...unit.querySelectorAll('img')];
-  images.forEach((img) => (img.loading = 'eager'));
-  await Promise.race([
-    Promise.all(images.map((img) => (img.complete ? null : img.decode().catch(() => null)))),
-    sleep(Math.max(0, deadline - Date.now())),
-  ]);
-
-  // 等布局稳定（流式渲染、代码高亮、公式排版等可能还在调整高度）
-  let last = -1;
-  for (let i = 0; i < 20; i++) {
-    await nextFrame();
-    const h = boxOf(unit).getBoundingClientRect().height;
-    if (h === last) break;
-    last = h;
-  }
+/** 滚动容器在视口中可见的区域（CSS px，取整） */
+function viewportOf(scroller: HTMLElement) {
+  const isDoc = scroller === document.scrollingElement || scroller === document.documentElement;
+  const r = isDoc ? new DOMRect(0, 0, innerWidth, innerHeight) : scroller.getBoundingClientRect();
+  const top = Math.ceil(Math.max(r.top, 0));
+  const bottom = Math.floor(Math.min(r.bottom, innerHeight));
+  const left = Math.ceil(Math.max(r.left, 0));
+  const right = Math.floor(Math.min(r.right, innerWidth));
+  return { top, bottom, left, right, height: bottom - top, rectTop: r.top };
 }
 
 /**
- * 每条消息下方的操作栏（复制、点赞、朗读、重新生成…）：
- * 从操作按钮向上找到不含任何文字和图片的最外层容器，整体排除。
+ * 截图期间要隐藏的悬浮元素：盖在对话区域上的 fixed / sticky 元素（顶栏、输入框、回到底部按钮等）。
+ * 对话内容里的 sticky 元素（如代码块标题）保留。
  */
-const ACTION_BUTTON_SELECTOR = '[data-testid$="turn-action-button"], .turn-action-controls button, [data-content-search-unit-key] button';
-/** 消息正文内部的按钮（代码块的复制按钮、引用来源等）属于内容，不排除 */
-const CONTENT_SELECTOR = '[data-markdown-text-style], [data-user-message-bubble], .markdown, pre';
-
-function collectActionBars(unit: HTMLElement): Set<Node> {
-  const nodes = new Set<Node>();
-  unit.querySelectorAll<HTMLElement>(ACTION_BUTTON_SELECTOR).forEach((button) => {
-    if (button.closest(CONTENT_SELECTOR)) return;
-    if (button.textContent?.trim()) return; // 只处理纯图标按钮
-    let node: HTMLElement = button;
-    while (
-      node.parentElement &&
-      node.parentElement !== unit &&
-      node.parentElement !== boxOf(unit) &&
-      !node.parentElement.textContent?.trim() &&
-      !node.parentElement.querySelector(`img, video, canvas, ${MESSAGE_SELECTOR}`)
-    ) {
-      node = node.parentElement;
+function markOverlays(scroller: HTMLElement) {
+  const anchors = findAnchors();
+  const view = viewportOf(scroller);
+  const isContent = (el: Element) => anchors.some((a) => a.contains(el) || el.contains(a));
+  for (const el of document.body.querySelectorAll<HTMLElement>('*')) {
+    const { position } = getComputedStyle(el);
+    if (position !== 'fixed' && position !== 'sticky') continue;
+    if (isContent(el)) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) continue;
+    if (r.bottom > view.top && r.top < view.bottom && r.right > view.left && r.left < view.right) {
+      el.setAttribute(ATTR_HIDE, '');
     }
-    nodes.add(node);
+  }
+}
+
+/** 轮次标识：用于统计轮数和恢复阅读位置 */
+function keyOf(anchor: HTMLElement): string {
+  return (
+    anchor.getAttribute('data-turn-key') ||
+    anchor.getAttribute('data-turn-id-container') ||
+    anchor.getAttribute('data-testid') ||
+    anchor.querySelector('[data-message-id]')?.getAttribute('data-message-id') ||
+    anchor.textContent?.trim().slice(0, 60) ||
+    ''
+  );
+}
+
+// ---------- 等待 ----------
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r(null)));
+
+/** 等视口内的图片加载完、布局稳定 */
+async function settle(scroller: HTMLElement) {
+  await nextFrame();
+  await nextFrame();
+  const view = viewportOf(scroller);
+  const pending = [...document.images].filter((img) => {
+    if (img.complete) return false;
+    const r = img.getBoundingClientRect();
+    return r.bottom > view.top && r.top < view.bottom;
   });
-  return nodes;
+  if (pending.length) {
+    await Promise.race([Promise.all(pending.map((img) => img.decode().catch(() => null))), sleep(3000)]);
+  }
+  let last = -1;
+  for (let i = 0; i < 10; i++) {
+    await nextFrame();
+    if (scroller.scrollHeight === last) break;
+    last = scroller.scrollHeight;
+  }
+  await sleep(80);
 }
 
-/** 跨域图片（如 files.oaiusercontent.com）交给后台脚本下载，避免 CORS 限制导致图片空白 */
-async function fetchViaBackground(url: string): Promise<string | false> {
-  if (url.startsWith('data:') || url.startsWith('blob:')) return false;
-  let target: URL;
-  try {
-    target = new URL(url, location.href);
-  } catch {
-    return false;
-  }
-  if (target.origin === location.origin) return false; // 同源资源走默认 fetch（自动带 cookie）
-  try {
-    const res = (await browser.runtime.sendMessage({
-      type: 'CGE_FETCH_DATA_URL',
-      url: target.href,
-    } satisfies BackgroundRequest)) as MessageResponse<string> | undefined;
-    return res?.ok ? res.result : false;
-  } catch {
-    return false;
+/** 滚动到顶部，直到 ChatGPT 不再加载更早的历史 */
+async function loadFullHistory(scroller: HTMLElement, isCancelled: () => boolean) {
+  let lastFirst: Element | null = null;
+  let lastHeight = -1;
+  let stable = 0;
+  for (let i = 0; i < 300 && stable < 3 && !isCancelled(); i++) {
+    scroller.scrollTop = 0;
+    await sleep(400);
+    const first = findAnchors()[0] ?? null;
+    if (first === lastFirst && scroller.scrollHeight === lastHeight) stable++;
+    else stable = 0;
+    lastFirst = first;
+    lastHeight = scroller.scrollHeight;
   }
 }
 
-/** 轮次中消息内容的水平范围（相对轮次节点左侧），用于裁剪两侧空白 */
-function contentRange(unit: HTMLElement, exclude: Set<Node>): { left: number; right: number } | null {
-  const base = boxOf(unit).getBoundingClientRect();
-  let left = Infinity;
-  let right = -Infinity;
-  const targets = outermost([...unit.querySelectorAll<HTMLElement>(MESSAGE_SELECTOR)]);
-  const nodes = targets.length ? targets : [unit.querySelector<HTMLElement>(TURN_CONTENT_SELECTOR) ?? unit];
-  for (const node of nodes) {
-    // 取消息内部可见子元素的范围（消息节点本身可能是整列宽度）
-    const walker = document.createTreeWalker(node, NodeFilter.SHOW_ELEMENT);
-    for (let el = walker.currentNode as Element | null; el; el = walker.nextNode() as Element | null) {
-      if (exclude.has(el)) continue;
-      if (el.children.length > 0 && el !== node) continue; // 只看叶子元素即可
-      const r = el.getBoundingClientRect();
-      if (r.width === 0 || r.height === 0) continue;
-      left = Math.min(left, r.left - base.left);
-      right = Math.max(right, r.right - base.left);
-    }
-  }
-  return Number.isFinite(left) && Number.isFinite(right) ? { left, right } : null;
+// ---------- 截屏与拼接 ----------
+
+let lastCapture = 0;
+
+async function captureViewport(): Promise<ImageBitmap> {
+  // captureVisibleTab 每秒最多调用 2 次
+  const wait = lastCapture + 520 - Date.now();
+  if (wait > 0) await sleep(wait);
+  lastCapture = Date.now();
+  const res = (await browser.runtime.sendMessage({ type: 'CGE_CAPTURE_TAB' } satisfies BackgroundRequest)) as
+    | MessageResponse<string>
+    | undefined;
+  if (!res?.ok) throw new Error(res?.error || '截屏失败');
+  const blob = await (await fetch(res.result)).blob();
+  return createImageBitmap(blob);
 }
 
 function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob> {
@@ -345,254 +215,232 @@ function canvasToBlob(canvas: HTMLCanvasElement): Promise<Blob> {
   });
 }
 
-interface Shot {
-  /** 截图压缩后的 PNG（不长期持有大画布，避免长对话占用数 GB 内存） */
-  png: Blob;
-  pxWidth: number;
-  pxHeight: number;
-  /** 该截图使用的缩放比例（极长的单轮会低于目标比例） */
-  scale: number;
-  /** 截图时的 CSS 宽度 */
-  width: number;
-  /** 与上一个轮次之间的间距（CSS px，页面中的真实间距） */
-  gapBefore: number;
-  range: { left: number; right: number } | null;
-}
-
-/** 把多个轮次截图按顺序拼接；超过 canvas 上限时切分成多张 */
-async function stitch(shots: Shot[], scale: number, background: string, cropSides: boolean): Promise<Blob[]> {
-  const width = Math.max(...shots.map((s) => s.width));
-  let left = 0;
-  let right = width;
-  // 两侧留白：内容可能正好铺满轮次节点（没有可保留的页面空白），因此留白由画布补出来
-  let side = EDGE_PADDING;
-  if (cropSides) {
-    const ranges = shots.map((s) => s.range).filter((r): r is NonNullable<Shot['range']> => !!r);
-    if (ranges.length) {
-      left = Math.max(0, Math.min(...ranges.map((r) => r.left)));
-      right = Math.min(width, Math.max(...ranges.map((r) => r.right)));
-      side = CROP_MARGIN;
-    }
-  }
-
-  // 分组：每组总高度不超过上限；被降低缩放的超长轮次单独成图
-  const groups: Shot[][] = [];
-  let current: Shot[] = [];
-  let height = 0;
-  const pad = EDGE_PADDING * scale;
-  for (const shot of shots) {
-    if (shot.scale !== scale) {
-      if (current.length) groups.push(current);
-      groups.push([shot]);
-      current = [];
-      height = 0;
-      continue;
-    }
-    const gap = current.length ? shot.gapBefore * scale : 0;
-    if (current.length && pad * 2 + height + gap + shot.pxHeight > MAX_CANVAS_PX) {
-      groups.push(current);
-      current = [];
-      height = 0;
-    }
-    height += (current.length ? gap : 0) + shot.pxHeight;
-    current.push(shot);
-  }
-  if (current.length) groups.push(current);
-
-  const blobs: Blob[] = [];
-  for (const group of groups) {
-    const s = group[0]!.scale;
-    const p = Math.round(EDGE_PADDING * s);
-    const gaps = group.map((shot, i) => (i ? Math.round(shot.gapBefore * s) : 0));
-    const out = document.createElement('canvas');
-    out.width = Math.round((right - left + side * 2) * s);
-    out.height = Math.min(
-      MAX_CANVAS_PX,
-      p * 2 + group.reduce((sum, shot, i) => sum + shot.pxHeight + gaps[i]!, 0),
-    );
-    const ctx = out.getContext('2d')!;
-    ctx.fillStyle = background;
-    ctx.fillRect(0, 0, out.width, out.height);
-    let y = p;
-    for (const [i, shot] of group.entries()) {
-      y += gaps[i]!;
-      const bitmap = await createImageBitmap(shot.png);
-      ctx.drawImage(bitmap, Math.round((side - left) * s), y);
-      bitmap.close();
-      y += shot.pxHeight;
-    }
-    blobs.push(await canvasToBlob(out));
-    out.width = out.height = 0;
-  }
-  return blobs;
-}
-
-// ---------- 截图 ----------
-
 /**
- * 按 id 找到轮次当前的节点并等待渲染完成。滚动可能触发 ChatGPT 懒加载更早的历史、重新渲染列表，
- * 因此渲染后再校验一次内容是否仍属于该轮次，不对就重新定位。
+ * 把一屏屏的截图写进长图。总高度事先未知（滚动过程中各轮可能才第一次渲染、高度变化），
+ * 按 canvas 上限分段按需创建；写满一段就压缩成 PNG 释放内存，最后一段按实际高度裁剪。
  */
-async function locateAndRender(id: string, hint: HTMLElement | undefined): Promise<HTMLElement | null> {
-  let unit: HTMLElement | null = hint && hint.isConnected && idOf(hint) === id ? hint : null;
-  for (let attempt = 0; attempt < 4; attempt++) {
-    unit ??= findConversationDom()?.turns.find((t) => t.id === id)?.unit ?? null;
-    if (!unit) return null;
-    await ensureRendered(unit);
-    const live = liveIdOf(unit);
-    if (unit.isConnected && (live === id || (live === null && id.startsWith('n:')))) return unit;
-    unit = null;
+class LongImage {
+  private segments = new Map<number, HTMLCanvasElement>();
+  private flushed = 0;
+  readonly blobs: Blob[] = [];
+
+  constructor(
+    private width: number,
+    private background: string,
+  ) {}
+
+  setWidth(width: number) {
+    this.width = width;
   }
-  return null;
+
+  private segment(index: number): HTMLCanvasElement {
+    let canvas = this.segments.get(index);
+    if (!canvas) {
+      canvas = document.createElement('canvas');
+      canvas.width = this.width;
+      canvas.height = MAX_CANVAS_PX;
+      const ctx = canvas.getContext('2d')!;
+      ctx.fillStyle = this.background;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      this.segments.set(index, canvas);
+    }
+    return canvas;
+  }
+
+  /** 把源图的一块画到长图的 (dx, dy) 像素位置 */
+  draw(source: CanvasImageSource, sx: number, sy: number, sw: number, sh: number, dx: number, dy: number) {
+    for (let index = Math.floor(dy / MAX_CANVAS_PX); index * MAX_CANVAS_PX < dy + sh; index++) {
+      const top = index * MAX_CANVAS_PX;
+      this.segment(index).getContext('2d')!.drawImage(source, sx, sy, sw, sh, dx, dy - top, sw, sh);
+    }
+  }
+
+  /** 已写到 y 像素：完整的分段输出为 PNG */
+  async flushUntil(y: number) {
+    while ((this.flushed + 1) * MAX_CANVAS_PX <= y) await this.output(this.flushed, MAX_CANVAS_PX);
+  }
+
+  /** 全部写完，总高度为 height 像素 */
+  async finish(height: number) {
+    while (this.flushed * MAX_CANVAS_PX < height) {
+      await this.output(this.flushed, Math.min(MAX_CANVAS_PX, height - this.flushed * MAX_CANVAS_PX));
+    }
+  }
+
+  private async output(index: number, height: number) {
+    const canvas = this.segment(index);
+    let target = canvas;
+    if (height < canvas.height) {
+      target = document.createElement('canvas');
+      target.width = canvas.width;
+      target.height = height;
+      target.getContext('2d')!.drawImage(canvas, 0, 0);
+    }
+    this.blobs.push(await canvasToBlob(target));
+    canvas.width = canvas.height = 0;
+    target.width = target.height = 0;
+    this.segments.delete(index);
+    this.flushed++;
+  }
 }
 
-/** 对话列表的滚动容器 */
-function scrollerOf(el: HTMLElement): HTMLElement {
-  for (let node: HTMLElement | null = el.parentElement; node; node = node.parentElement) {
-    const { overflowY } = getComputedStyle(node);
-    if (/(auto|scroll|overlay)/.test(overflowY) && node.scrollHeight > node.clientHeight) return node;
-  }
-  return (document.scrollingElement as HTMLElement | null) ?? document.documentElement;
-}
-
-const atBottom = (sc: HTMLElement) => sc.scrollHeight - sc.scrollTop - sc.clientHeight < 4;
-
-/** 滚动到顶部，直到 ChatGPT 不再加载更早的历史 */
-async function loadFullHistory(scroller: HTMLElement, onProgress: (text: string) => void) {
-  let lastFirst = '';
-  let lastHeight = -1;
-  let stable = 0;
-  for (let i = 0; i < 300 && stable < 3; i++) {
-    scroller.scrollTop = 0;
-    await sleep(400);
-    const first = findConversationDom()?.turns[0];
-    const key = first ? keysOf(first).join() : '';
-    if (key === lastFirst && scroller.scrollHeight === lastHeight) stable++;
-    else stable = 0;
-    lastFirst = key;
-    lastHeight = scroller.scrollHeight;
-    if (i % 5 === 4) onProgress('正在加载完整对话历史…');
-  }
-}
+// ---------- 主流程 ----------
 
 export interface CaptureResult {
   blobs: Blob[];
   turnCount: number;
 }
 
-export async function captureConversation(
-  selection: TurnSelection,
-  options: ImageOptions,
-  onProgress: (text: string) => void,
-): Promise<CaptureResult> {
-  const dom0 = findConversationDom();
-  if (!dom0) throw new Error(`页面上没有找到对话节点。（${domDiagnostics()}）`);
-  if (selection.mode === 'only' && selection.marked.size === 0) throw new Error('请至少选择一轮对话。');
-  const background = backgroundColorOf(dom0.root);
-  const scroller = scrollerOf(dom0.root);
+export interface CaptureControl {
+  onProgress: (text: string) => void;
+  isCancelled: () => boolean;
+}
 
-  // 记录阅读位置：结束后回到同一轮次（历史加载后 scrollTop 数值会变，不能直接恢复）
-  const wasAtBottom = atBottom(scroller);
-  const viewTop = scroller === document.documentElement ? 0 : scroller.getBoundingClientRect().top;
-  const anchor = dom0.turns.find((t) => boxOf(t.unit).getBoundingClientRect().bottom > viewTop);
-  const anchorKeys = anchor ? keysOf(anchor) : [];
-  const anchorOffset = anchor ? boxOf(anchor.unit).getBoundingClientRect().top - viewTop : 0;
-  const scrollBefore = scroller.scrollTop;
+export async function captureConversation(options: ImageOptions, control: CaptureControl): Promise<CaptureResult> {
+  const { onProgress, isCancelled } = control;
+  const anchors0 = findAnchors();
+  const first = anchors0[0];
+  if (!first) throw new Error(`页面上没有找到对话内容，请等待对话加载完成后重试。（${domDiagnostics()}）`);
+  const scroller = scrollerOf(first);
+  const background = backgroundColorOf(scroller);
+  // 之后只在这个滚动容器里找对话节点（忽略页面中其它隐藏的对话副本）
+  scope = scroller;
 
-  // 只选了当前已挂载的轮次时无需滚动整段对话
-  const targets = selection.mode === 'only' ? [...selection.marked.values()] : [];
-  const mountedKeys = new Set(dom0.turns.flatMap(keysOf));
-  const quick = selection.mode === 'only' && targets.every((group) => group.some((k) => mountedKeys.has(k)));
+  // 记录阅读位置，结束后回去
+  const wasAtBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 8;
+  const view0 = viewportOf(scroller);
+  const anchorEl = anchors0.find((a) => a.getBoundingClientRect().bottom > view0.top) ?? first;
+  const anchorKey = keyOf(anchorEl);
+  const anchorOffset = anchorEl.getBoundingClientRect().top - view0.top;
 
+  const style = document.createElement('style');
+  style.textContent = CAPTURE_STYLE;
+  document.head.appendChild(style);
+  scroller.setAttribute(ATTR_SCROLLER, '');
+  document.documentElement.toggleAttribute(ATTR_HIDE_ACTIONS, options.hideActions);
   document.documentElement.setAttribute(ATTR_CAPTURING, '');
-  const processed = new Set<string>();
-  const isDone = (t: Turn) =>
-    processed.has(t.id) || (t.messageIds.length > 0 && t.messageIds.every((k) => processed.has(k)));
-  const remainingTargets = () => targets.filter((group) => !group.some((k) => processed.has(k))).length;
-  const shots: Shot[] = [];
-  let prev: HTMLElement | null = null;
+  // 透明遮罩：截图期间挡住鼠标操作（完全透明，不会出现在截图里）
+  const shield = document.createElement('div');
+  shield.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:transparent;cursor:progress;';
+  document.documentElement.appendChild(shield);
 
-  const captureOne = async (turn: Turn) => {
-    onProgress(`正在截取第 ${shots.length + 1} 轮…`);
-    const unit = await locateAndRender(turn.id, turn.unit);
-    if (!unit) throw new Error(`第 ${shots.length + 1} 轮在页面中找不到了（对话列表可能刚刚刷新），请重试。`);
-    const box = boxOf(unit);
-    const rect = box.getBoundingClientRect();
-    // 与上一轮在页面中相邻时沿用真实间距；中间隔着未选中的轮次时不留额外空隙
-    const adjacent = prev && prev.isConnected && unit.previousElementSibling === prev;
-    const gapBefore = adjacent ? Math.min(Math.max(0, rect.top - boxOf(prev!).getBoundingClientRect().bottom), 48) : 0;
-    const actionBars = options.hideActions ? collectActionBars(unit) : new Set<Node>();
-    const scale = Math.min(options.scale, MAX_CANVAS_PX / Math.max(1, rect.height));
-    const canvas = await domToCanvas(box, {
-      scale,
-      backgroundColor: background,
-      filter: (node) => !actionBars.has(node),
-      fetchFn: fetchViaBackground,
-    });
-    if (canvas.width === 0 || canvas.height === 0) {
-      throw new Error(`第 ${shots.length + 1} 轮截图失败：尺寸 ${Math.round(rect.width)}x${Math.round(rect.height)} 的节点生成了空白画布。`);
-    }
-    const png = await canvasToBlob(canvas);
-    shots.push({ png, pxWidth: canvas.width, pxHeight: canvas.height, scale, width: rect.width, gapBefore, range: contentRange(unit, actionBars) });
-    canvas.width = canvas.height = 0;
-    prev = unit;
-    // 渲染后消息 ID 才完整（旧版占位节点），重新读取
-    keysOf({ ...turn, messageIds: messageIdsOf(unit) }).forEach((k) => processed.add(k));
+  const checkCancelled = () => {
+    if (isCancelled()) throw new Error('已取消截图。');
   };
 
   try {
-    await document.fonts.ready;
-    if (quick) {
-      for (const turn of dom0.turns) if (isSelected(turn, selection)) await captureOne(turn);
-    } else {
-      onProgress('正在加载完整对话历史…');
-      await loadFullHistory(scroller, onProgress);
-      // 自上而下扫描：每次处理当前挂载的第一个未处理轮次，处理完滚到下一屏
-      let idle = 0;
-      while (idle < 30) {
-        if (selection.mode === 'only' && remainingTargets() === 0) break;
-        const dom = findConversationDom();
-        const next = dom?.turns.find((t) => !isDone(t));
-        if (!next) {
-          if (atBottom(scroller)) break;
-          const before = scroller.scrollTop;
-          scroller.scrollTop += Math.max(200, scroller.clientHeight * 0.8);
-          await sleep(250);
-          idle = scroller.scrollTop === before ? idle + 1 : 0;
-          continue;
-        }
-        idle = 0;
-        if (isSelected(next, selection)) await captureOne(next);
-        else {
-          keysOf(next).forEach((k) => processed.add(k));
-          prev = null;
-        }
+    // 1. 加载完整历史，再完整滚一遍让每轮的高度都测量好，避免截图时布局跳动造成接缝
+    onProgress('正在加载完整对话…');
+    await loadFullHistory(scroller, isCancelled);
+    checkCancelled();
+    onProgress('正在预加载内容…');
+    for (let y = 0; y < scroller.scrollHeight; y += Math.max(200, scroller.clientHeight * 0.9)) {
+      scroller.scrollTop = y;
+      await settle(scroller);
+      await sleep(60);
+      checkCancelled();
+    }
+    scroller.scrollTop = scroller.scrollHeight;
+    await settle(scroller);
+
+    // 2. 隐藏盖在对话区域上的悬浮元素
+    markOverlays(scroller);
+    await settle(scroller);
+
+    // 3. 截取范围：第一轮顶部到最后一轮底部（滚动内容坐标）、对话列左右两侧
+    const view = viewportOf(scroller);
+    const toContentY = (viewportY: number) => viewportY - view.rectTop + scroller.scrollTop;
+    const endAnchors = findAnchors();
+
+    let colLeft = view.left;
+    let colRight = view.right;
+    let margin = 0;
+    if (options.cropSides) {
+      const rects = endAnchors
+        .flatMap((a) => [...a.querySelectorAll(MESSAGE_SELECTOR)])
+        .map((el) => el.getBoundingClientRect())
+        .filter((r) => r.width > 0);
+      if (rects.length) {
+        colLeft = Math.max(view.left, Math.floor(Math.min(...rects.map((r) => r.left))));
+        colRight = Math.min(view.right, Math.ceil(Math.max(...rects.map((r) => r.right))));
+        margin = SIDE_MARGIN;
       }
     }
-    if (shots.length === 0) throw new Error('没有截取到任何轮次，请确认已选择要导出的对话。');
 
-    onProgress('正在拼接图片…');
-    return { blobs: await stitch(shots, options.scale, background, options.cropSides), turnCount: shots.length };
+    scroller.scrollTop = 0;
+    await settle(scroller);
+    const firstAnchor = findAnchors()[0]!;
+    const startY = Math.max(0, Math.floor(toContentY(firstAnchor.getBoundingClientRect().top) - EDGE_PADDING));
+
+    // 4. 从上到下逐屏截图，直到滚动到底部
+    const image = new LongImage(0, background);
+    let ratio = 0;
+    const turnKeys = new Set<string>();
+    let y = startY;
+    let endY = Number.POSITIVE_INFINITY;
+    while (y < endY) {
+      checkCancelled();
+      scroller.scrollTop = y - (view.top - view.rectTop);
+      await settle(scroller);
+      findAnchors().forEach((a) => turnKeys.add(keyOf(a)));
+      // 到底部后才确定结束位置：最后一轮底部再留一点边距
+      if (scroller.scrollTop >= scroller.scrollHeight - scroller.clientHeight - 1) {
+        const anchors = findAnchors();
+        const last = anchors[anchors.length - 1];
+        endY = last ? Math.ceil(toContentY(last.getBoundingClientRect().bottom) + EDGE_PADDING) : scroller.scrollHeight;
+      }
+      // 当前视口能看到的内容范围
+      const visibleFrom = scroller.scrollTop + (view.top - view.rectTop);
+      const visibleTo = visibleFrom + view.height;
+      const sliceFrom = Math.max(y, visibleFrom);
+      const sliceTo = Math.min(endY, visibleTo);
+      if (sliceTo <= sliceFrom) break;
+
+      const shot = await captureViewport();
+      if (!ratio) {
+        ratio = shot.width / innerWidth;
+        image.setWidth(Math.round((colRight - colLeft + margin * 2) * ratio));
+      }
+      const dy = Math.round((sliceFrom - startY) * ratio);
+      const sh = Math.round((sliceTo - startY) * ratio) - dy;
+      const sy = Math.round((view.top + sliceFrom - visibleFrom) * ratio);
+      image.draw(shot, Math.round(colLeft * ratio), sy, Math.round((colRight - colLeft) * ratio), sh, Math.round(margin * ratio), dy);
+      shot.close();
+      y = sliceTo;
+      await image.flushUntil(Math.round((y - startY) * ratio));
+      const total = Number.isFinite(endY) ? endY : scroller.scrollHeight;
+      onProgress(`正在截图… ${Math.min(99, Math.round(((y - startY) / Math.max(1, total - startY)) * 100))}%`);
+    }
+    if (!ratio) throw new Error('没有截取到任何内容。');
+    onProgress('正在生成图片…');
+    await image.finish(Math.round((y - startY) * ratio));
+    return { blobs: image.blobs, turnCount: turnKeys.size };
   } finally {
+    scope = document;
+    shield.remove();
     document.documentElement.removeAttribute(ATTR_CAPTURING);
-    if (quick) scroller.scrollTop = scrollBefore;
-    else await restorePosition(scroller, wasAtBottom, anchorKeys, anchorOffset, viewTop);
+    document.documentElement.removeAttribute(ATTR_HIDE_ACTIONS);
+    scroller.removeAttribute(ATTR_SCROLLER);
+    document.querySelectorAll(`[${ATTR_HIDE}]`).forEach((el) => el.removeAttribute(ATTR_HIDE));
+    style.remove();
+    await restorePosition(scroller, wasAtBottom, anchorKey, anchorOffset);
   }
 }
 
-/** 回到导出前的阅读位置 */
-async function restorePosition(scroller: HTMLElement, wasAtBottom: boolean, keys: string[], offset: number, viewTop: number) {
-  if (wasAtBottom || keys.length === 0) {
+/** 回到导出前的阅读位置（历史加载后 scrollTop 数值会变，按轮次定位） */
+async function restorePosition(scroller: HTMLElement, wasAtBottom: boolean, key: string, offset: number) {
+  scroller.scrollTop = scroller.scrollHeight;
+  if (wasAtBottom || !key) {
+    // 截图样式移除后布局可能还会变化，稍后再滚到底一次
+    await sleep(300);
     scroller.scrollTop = scroller.scrollHeight;
     return;
   }
-  // 从底部往上找原来的轮次
-  scroller.scrollTop = scroller.scrollHeight;
   for (let i = 0; i < 200; i++) {
-    await sleep(150);
-    const turn = findConversationDom()?.turns.find((t) => keysOf(t).some((k) => keys.includes(k)));
-    if (turn) {
-      scroller.scrollTop += boxOf(turn.unit).getBoundingClientRect().top - viewTop - offset;
+    await sleep(120);
+    const anchor = findAnchors().find((a) => keyOf(a) === key);
+    if (anchor) {
+      scroller.scrollTop += anchor.getBoundingClientRect().top - viewportOf(scroller).top - offset;
       return;
     }
     if (scroller.scrollTop === 0) return;

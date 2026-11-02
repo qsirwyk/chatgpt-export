@@ -2,7 +2,7 @@
   "name": "chatgpt-export",
   "description": "将 ChatGPT 对话导出为 Markdown 或 PNG 长图的浏览器插件",
   "private": true,
-  "version": "1.2.0",
+  "version": "1.3.0",
   "type": "module",
   "scripts": {
     "dev": "wxt",
@@ -13,9 +13,6 @@
     "zip:firefox": "wxt zip -b firefox",
     "compile": "tsc --noEmit",
     "postinstall": "wxt prepare"
-  },
-  "dependencies": {
-    "modern-screenshot": "4.7.0"
   },
   "devDependencies": {
     "typescript": "6.0.3",

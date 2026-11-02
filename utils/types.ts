@@ -39,12 +39,13 @@ export interface Conversation {
 export type ContentRequest =
   | { type: 'CGE_PING' }
   | { type: 'CGE_EXPORT_MD'; embedImages: boolean }
-  | { type: 'CGE_START_IMAGE_MODE' };
+  | { type: 'CGE_EXPORT_IMAGE'; options: ImageOptions };
 
-/** 内容脚本 → 后台 */
+/** 内容脚本 → 后台（CGE_PROGRESS 同时会发给打开着的弹窗） */
 export type BackgroundRequest =
-  | { type: 'CGE_FETCH_DATA_URL'; url: string }
-  | { type: 'CGE_DOWNLOAD'; url: string; filename: string };
+  | { type: 'CGE_CAPTURE_TAB' }
+  | { type: 'CGE_DOWNLOAD'; url: string; filename: string }
+  | { type: 'CGE_PROGRESS'; text: string };
 
 export interface PingResult {
   conversationId: string | null;
@@ -58,16 +59,20 @@ export interface ExportMarkdownResult {
   messageCount: number;
 }
 
+export interface ExportImageResult {
+  files: string[];
+  turnCount: number;
+}
+
 export type MessageResponse<T> = { ok: true; result: T } | { ok: false; error: string };
 
-/** 图片导出选项（保存在 storage.local） */
+/** 图片导出选项（保存在 storage.local）。清晰度即屏幕本身的像素密度 */
 export interface ImageOptions {
-  scale: 1 | 2 | 3;
   hideActions: boolean;
   cropSides: boolean;
 }
 
-export const DEFAULT_IMAGE_OPTIONS: ImageOptions = { scale: 2, hideActions: true, cropSides: true };
+export const DEFAULT_IMAGE_OPTIONS: ImageOptions = { hideActions: true, cropSides: true };
 
 export const EMBED_IMAGES_KEY = 'cge:embedImages';
 export const IMAGE_OPTIONS_KEY = 'cge:imageOptions';

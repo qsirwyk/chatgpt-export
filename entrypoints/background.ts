@@ -1,41 +1,48 @@
 // 后台脚本：
-// - 代替内容脚本下载跨域图片（files.oaiusercontent.com 等不一定返回 CORS 头），转成 data URL 供截图内嵌；
-// - 调用 downloads API 保存导出的图片到「下载/ChatGPT」目录。
+// - 截取当前标签页的可见区域（captureVisibleTab 只能在扩展页面 / 后台调用）；
+// - 调用 downloads API 保存导出的图片到「下载/ChatGPT」目录；
+// - 截图进度显示在插件图标的角标上。
 import { defineBackground } from 'wxt/utils/define-background';
-import { browser } from 'wxt/browser';
+import { browser, type Browser } from 'wxt/browser';
 import type { BackgroundRequest, MessageResponse } from '@/utils/types';
 
-/** 只代理 ChatGPT 相关域名的资源（带 cookie） */
-const ALLOWED_HOSTS = /(^|\.)(chatgpt\.com|openai\.com|oaistatic\.com|oaiusercontent\.com)$/i;
-/** 引用来源的网站图标（Google favicon 服务，不带 cookie） */
-const isFavicon = (u: URL) =>
-  (u.hostname === 'www.google.com' && u.pathname.startsWith('/s2/favicons')) ||
-  (/^t\d*\.gstatic\.com$/.test(u.hostname) && u.pathname.startsWith('/faviconV2'));
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function fetchAsDataUrl(url: string): Promise<string> {
-  const target = new URL(url);
-  const trusted = ALLOWED_HOSTS.test(target.hostname);
-  if (target.protocol !== 'https:' || !(trusted || isFavicon(target))) {
-    throw new Error(`不允许的地址：${target.hostname}`);
+async function captureTab(tab: Browser.tabs.Tab | undefined): Promise<string> {
+  if (!tab?.id || tab.windowId == null) throw new Error('找不到要截图的标签页。');
+  const [active] = await browser.tabs.query({ active: true, windowId: tab.windowId });
+  if (active?.id !== tab.id) throw new Error('截图期间请保持 ChatGPT 标签页在前台，不要切换标签页。');
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await browser.tabs.captureVisibleTab(tab.windowId, { format: 'png' });
+    } catch (err) {
+      // 超过每秒调用次数上限时稍等重试
+      if (attempt < 3 && /MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND/i.test(String(err))) {
+        await sleep(600);
+        continue;
+      }
+      throw err;
+    }
   }
-  const res = await fetch(target.href, { credentials: trusted ? 'include' : 'omit' });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const type = res.headers.get('content-type')?.split(';')[0] || 'application/octet-stream';
-  const bytes = new Uint8Array(await res.arrayBuffer());
-  let binary = '';
-  for (let i = 0; i < bytes.length; i += 0x8000) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
-  }
-  return `data:${type};base64,${btoa(binary)}`;
+}
+
+function setBadge(text: string, tabId?: number) {
+  const percent = text.match(/(\d+)%/)?.[1];
+  const badge = !text ? '' : percent ? `${percent}%` : '…';
+  browser.action.setBadgeBackgroundColor({ color: '#10a37f' }).catch(() => {});
+  browser.action.setBadgeText({ text: badge, tabId }).catch(() => {});
 }
 
 export default defineBackground(() => {
   browser.runtime.onMessage.addListener((request: BackgroundRequest, sender, sendResponse) => {
     // 只处理本扩展内容脚本发来的消息
-    if (sender.id !== browser.runtime.id) return false;
+    if (sender.id !== browser.runtime.id || !sender.tab) return false;
     let task: Promise<unknown>;
-    if (request?.type === 'CGE_FETCH_DATA_URL') {
-      task = fetchAsDataUrl(request.url);
+    if (request?.type === 'CGE_PROGRESS') {
+      setBadge(request.text, sender.tab.id);
+      return false;
+    } else if (request?.type === 'CGE_CAPTURE_TAB') {
+      task = captureTab(sender.tab);
     } else if (request?.type === 'CGE_DOWNLOAD') {
       if (!request.url.startsWith('data:image/png')) return false;
       task = browser.downloads.download({ url: request.url, filename: request.filename, saveAs: false, conflictAction: 'uniquify' });

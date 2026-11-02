@@ -3,7 +3,7 @@
 基于 [WXT](https://wxt.dev) + TypeScript 的浏览器插件（Manifest V3），把当前打开的 ChatGPT 对话导出为：
 
 - **Markdown**：带 YAML front matter，保留代码块、公式、表格；联网搜索的引用转成脚注链接；对话中的图片可选择以 base64 内嵌。
-- **图片（PNG 长图）**：直接截取 ChatGPT 页面自身渲染的对话 DOM，与网页显示效果一致（主题、字体、公式、代码块、图片都是页面原样），不做任何重新排版。
+- **图片（PNG 长图）**：自动滚动整段对话，逐屏截取浏览器真实画出的页面后拼接，与网页显示效果完全一致（主题、字体、公式、代码块、图片都是页面原样）。
 
 Markdown 的思路参考 [huhusmang/ChatGPT-Exporter](https://github.com/huhusmang/ChatGPT-Exporter)：通过 `/api/auth/session` 获取 Access Token，调用 `/backend-api/conversation/<id>` 取完整对话，再沿 `current_node` 回溯出当前显示的分支。
 
@@ -32,37 +32,28 @@ npm run build:firefox / zip:firefox   # Firefox 版本
 | 按钮 | 说明 |
 |---|---|
 | 导出 Markdown | 直接下载 `标题_时间.md`。勾选「内嵌对话图片」时图片以 base64 写入文件（文件会变大）；不勾选时只保留占位说明。 |
-| 导出图片 | 页面进入选择模式：底部出现工具栏（全选 / 全不选 / 最后一轮、清晰度 1x–3x、隐藏操作按钮、裁剪两侧空白），然后「下载 PNG」或「复制」。默认导出整段对话（包括尚未加载的历史）；取消某轮左侧的勾选即排除该轮，点「全不选」后再勾选则只导出勾选的轮次。按 Esc 或「退出」恢复页面。 |
+| 导出图片 | 自动加载完整对话并从上到下滚动截图，保存到「下载/ChatGPT」。可选「隐藏复制、点赞等操作按钮」「裁剪两侧空白」。截图期间请保持该标签页在前台、不要滚动页面，按 Esc 取消。 |
 
 ### 图片导出的实现
 
-ChatGPT 的对话列表是**虚拟滚动**的，目前有两种形态：
+1. 滚动到顶部，直到 ChatGPT 不再加载更早的历史（新版页面只挂载视口附近的几轮，历史是懒加载的）；
+2. 再从上到下完整滚动一遍，让每轮的高度都测量好，避免截图时布局跳动；
+3. 隐藏盖在对话区域上的悬浮元素（顶栏、输入框等）和滚动条，可选隐藏操作按钮；
+4. 逐屏滚动，用 `tabs.captureVisibleTab` 截取浏览器画面，按滚动距离拼接；滚到底部时才确定结束位置；
+5. 超过 canvas 上限（30000px）时自动切分成多张（`_1of2.png` …），最后回到原来的阅读位置。
 
-- 2026 版：滑动窗口，只挂载视口附近的约 7 轮（`div[data-turn-key]`，一问一答为一轮），窗口外的轮次没有任何 DOM 节点；滚动到顶部时才懒加载更早的历史，并可能重新分组。
-- 2025 版：每轮都有占位容器 `div[data-turn-id-container]`，只在视口附近渲染内容。
-
-因此导出流程是：
-
-1. 滚动到顶部，直到不再加载更早的历史；
-2. 自上而下逐屏滚动，按消息 ID（`data-chatgpt-search-message-ids` 等）去重，等每个选中的轮次渲染完成、图片加载完；
-3. 用 [modern-screenshot](https://github.com/qq15725/modern-screenshot) 截取该轮次的真实 DOM（SVG foreignObject，由浏览器自己绘制）。跨域图片（`images.openai.com`、引用来源的网站图标等）由后台脚本代为下载，避免 CORS 导致空白。每轮截完立即压缩成 PNG，避免长对话占用大量内存；
-4. 按页面中的真实间距拼接成长图，最后回到原来的阅读位置。
-
-只选择了当前屏幕附近的轮次时，跳过第 1、2 步直接截图。
-
-浏览器单个 canvas 的高度上限约 32767px，超出时按轮次边界自动切分成多张（`_1of2.png` …），保存在下载目录的 `ChatGPT/` 子文件夹中。图片导出也支持 `chatgpt.com/share/...` 分享页。
+清晰度等于屏幕本身的像素密度（高分屏为 2x）。`captureVisibleTab` 每秒最多调用 2 次，长对话需要几十秒。截图需要 `activeTab` 权限：点击插件图标打开弹窗时自动获得。
 
 ## 目录结构
 
 ```
 wxt.config.ts                 # manifest 配置（权限、名称等）
 entrypoints/
-  background.ts               # 后台：代理下载跨域图片、调用 downloads API 保存 PNG
+  background.ts               # 后台：截取标签页画面、调用 downloads API 保存 PNG
   content/
     index.ts                  # 内容脚本入口与消息分发
     api.ts                    # 取 token、请求对话、生成并下载 Markdown
-    capture.ts                # 识别对话 DOM、逐轮渲染并截图、拼接/切分
-    selection.ts              # 页面内选择模式：勾选框覆盖层 + 底部工具栏（Shadow DOM）
+    capture.ts                # 滚动截图：加载完整历史、逐屏截取并拼接/切分
   popup/                      # 工具栏弹窗
 utils/
   types.ts                    # 共享类型与常量
@@ -74,6 +65,6 @@ public/icon/                  # 插件图标
 
 - 只导出当前对话中 user / assistant 的可见文本和图片；代码解释器的执行过程、推理过程等工具消息不导出（生成的图片会保留）。
 - Markdown 依赖 ChatGPT 的非公开接口，接口变化时需要调整 `entrypoints/content/api.ts` 和 `utils/conversation.ts`。
-- 图片依赖 ChatGPT 页面的 DOM 结构（`data-turn-key`、`data-conversation-role`、`data-chatgpt-search-message-ids`、`.turn-action-controls`，以及旧版的 `data-turn-id-container`、`data-message-author-role` 等），页面改版时需要调整 `entrypoints/content/capture.ts`。识别失败时弹窗会显示各类节点的数量，便于排查。
-- 导出整段对话时页面会滚动一遍完整历史，较慢：实测 14 轮约 4–5 分钟，原因尚未查明。只导出当前屏幕附近的几轮时很快（每轮约 2 秒）。
+- 图片依赖 ChatGPT 页面的 DOM 结构来定位对话和滚动容器（`data-turn-key`、`data-turn-id-container`、`data-message-author-role` 等），页面改版时需要调整 `entrypoints/content/capture.ts`。识别失败时会显示各类节点的数量，便于排查。
+- 截图期间切换标签页、最小化窗口或手动滚动会导致截图错误；对话中代码块等内容自身的 sticky 标题可能在接缝处重复出现。
 - Team / Enterprise 工作区通过 `_account` cookie 识别，若请求返回 404 请先在页面中切换到对应工作区。
