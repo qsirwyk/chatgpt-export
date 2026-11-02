@@ -16,7 +16,7 @@ const ATTR_SCROLLER = 'data-cge-scroller';
 const ATTR_HIDE_ACTIONS = 'data-cge-hide-actions';
 
 const CAPTURE_STYLE = `
-html[${ATTR_CAPTURING}] [${ATTR_HIDE}] { visibility: hidden !important; }
+html[${ATTR_CAPTURING}] [${ATTR_HIDE}] { visibility: hidden !important; opacity: 0 !important; }
 html[${ATTR_CAPTURING}] [${ATTR_SCROLLER}] {
   scrollbar-width: none !important; scroll-behavior: auto !important; overflow-anchor: none !important;
   pointer-events: none !important;
@@ -118,23 +118,33 @@ function viewportOf(scroller: HTMLElement) {
 }
 
 /**
- * 截图期间要隐藏的悬浮元素：盖在对话区域上的 fixed / sticky 元素（顶栏、输入框、回到底部按钮等）。
- * 对话内容里的 sticky 元素（如代码块标题）保留。
+ * 截图期间要隐藏的元素：只保留对话滚动容器及其祖先链，其余全部隐藏（visibility，不影响布局）。
+ * - 滚动容器之外：祖先链上每一层的兄弟节点，包括顶栏、输入框（absolute 浮在对话底部）、渐变遮罩、侧栏等；
+ * - 滚动容器之内：对话列表之外的悬浮元素（回到底部按钮等）。对话内容自身（含代码块的 sticky 标题）保留。
  */
 function markOverlays(scroller: HTMLElement) {
-  const anchors = findAnchors();
-  const view = viewportOf(scroller);
-  const isContent = (el: Element) => anchors.some((a) => a.contains(el) || el.contains(a));
-  for (const el of document.body.querySelectorAll<HTMLElement>('*')) {
-    const { position } = getComputedStyle(el);
-    if (position !== 'fixed' && position !== 'sticky') continue;
-    if (isContent(el)) continue;
-    const r = el.getBoundingClientRect();
-    if (r.width === 0 || r.height === 0) continue;
-    if (r.bottom > view.top && r.top < view.bottom && r.right > view.left && r.left < view.right) {
-      el.setAttribute(ATTR_HIDE, '');
+  const hide = (el: Element) => el.setAttribute(ATTR_HIDE, '');
+  if (scroller !== document.documentElement && scroller !== document.body) {
+    for (let node: HTMLElement = scroller; node.parentElement && node !== document.body; node = node.parentElement) {
+      for (const sibling of node.parentElement.children) {
+        if (sibling !== node && !/^(SCRIPT|STYLE|LINK|META)$/.test(sibling.tagName)) hide(sibling);
+      }
     }
   }
+  const anchors = findAnchors();
+  const list = anchors.length > 1 ? commonAncestor(anchors) : (anchors[0]?.parentElement ?? null);
+  if (!list) return;
+  for (const el of scroller.querySelectorAll<HTMLElement>('*')) {
+    if (list.contains(el) || el.contains(list)) continue;
+    const { position } = getComputedStyle(el);
+    if (position === 'fixed' || position === 'sticky' || position === 'absolute') hide(el);
+  }
+}
+
+function commonAncestor(elements: HTMLElement[]): HTMLElement | null {
+  let node: HTMLElement | null = elements[0] ?? null;
+  while (node && !elements.every((el) => node!.contains(el))) node = node.parentElement;
+  return node;
 }
 
 /** 轮次标识：用于统计轮数和恢复阅读位置 */
