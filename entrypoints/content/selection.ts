@@ -14,12 +14,14 @@ import {
   ATTR_CAPTURING,
   ATTR_EXCLUDED,
   ATTR_UNIT,
-  captureTurns,
+  captureConversation,
   findConversationDom,
+  isSelected,
+  keysOf,
   boxOf,
   domDiagnostics,
   type ConversationDom,
-  type Turn,
+  type TurnSelection,
 } from './capture';
 
 const PAGE_STYLE = `
@@ -79,8 +81,12 @@ export function startSelectionMode(): number {
 
 class SelectionMode {
   private dom: ConversationDom;
-  private excluded = new WeakSet<HTMLElement>();
-  private checks = new Map<HTMLElement, HTMLInputElement>();
+  /**
+   * 选择状态按轮次标识记录（节点会被 ChatGPT 替换/复用；新版页面只挂载视口附近的轮次，
+   * 默认「全部」表示整段对话，包括当前没有挂载的轮次）
+   */
+  private selection: TurnSelection = { mode: 'all', marked: new Map() };
+  private checks = new Map<string, HTMLInputElement>();
   private options: ImageOptions = { ...DEFAULT_IMAGE_OPTIONS };
   private host: HTMLElement;
   private shadow: ShadowRoot;
@@ -91,6 +97,7 @@ class SelectionMode {
   private raf = 0;
   private rescanTimer = 0;
   private busy = false;
+  private lastTurnCount = 0;
   private readonly pathname = location.pathname;
 
   constructor(dom: ConversationDom) {
@@ -156,13 +163,10 @@ class SelectionMode {
     bar.addEventListener('click', (e) => {
       const act = (e.target as HTMLElement).closest<HTMLElement>('[data-act]')?.dataset.act;
       if (!act || this.busy) return;
-      if (act === 'all') this.select(() => true);
-      else if (act === 'none') this.select(() => false);
-      else if (act === 'last') {
-        const lastUser = this.dom.turns.map((t) => t.role).lastIndexOf('user');
-        const start = lastUser >= 0 ? lastUser : Math.max(0, this.dom.turns.length - 1);
-        this.select((_, i) => i >= start);
-      } else if (act === 'download') this.download();
+      if (act === 'all') this.setSelection('all');
+      else if (act === 'none') this.setSelection('only');
+      else if (act === 'last') this.selectLast();
+      else if (act === 'download') this.download();
       else if (act === 'copy') this.copy();
       else if (act === 'exit') this.destroy();
     });
@@ -200,63 +204,97 @@ class SelectionMode {
   // ---------- 选择 ----------
 
   private syncTurns() {
-    const current = new Set(this.dom.turns.map((t) => t.unit));
-    for (const [unit, check] of this.checks) {
-      if (!current.has(unit)) {
+    const current = new Set(this.dom.turns.map((t) => t.id));
+    for (const [id, check] of this.checks) {
+      if (!current.has(id)) {
         check.remove();
-        this.checks.delete(unit);
+        this.checks.delete(id);
       }
     }
-    for (const { unit } of this.dom.turns) {
-      if (!this.checks.has(unit)) {
-        const check = document.createElement('input');
-        check.type = 'checkbox';
-        check.className = 'check';
-        check.title = '是否包含在图片中';
-        check.checked = !this.excluded.has(unit);
-        check.addEventListener('change', () => this.setIncluded(unit, check.checked));
-        this.layer.appendChild(check);
-        this.checks.set(unit, check);
+    for (const turn of this.dom.turns) {
+      let check = this.checks.get(turn.id);
+      if (!check) {
+        const created = document.createElement('input');
+        created.type = 'checkbox';
+        created.className = 'check';
+        created.title = '是否包含在图片中';
+        created.addEventListener('change', () => {
+          const current = this.dom.turns.find((t) => t.id === turn.id);
+          if (current) this.toggle(current.id, keysOf(current), created.checked);
+        });
+        this.layer.appendChild(created);
+        this.checks.set(turn.id, created);
+        check = created;
       }
-      unit.toggleAttribute(ATTR_EXCLUDED, this.excluded.has(unit));
+      const selected = isSelected(turn, this.selection);
+      check.checked = selected;
+      turn.unit.toggleAttribute(ATTR_EXCLUDED, !selected);
     }
     this.updateCount();
   }
 
-  private setIncluded(unit: HTMLElement, included: boolean) {
-    if (included) this.excluded.delete(unit);
-    else this.excluded.add(unit);
-    unit.toggleAttribute(ATTR_EXCLUDED, !included);
-    const check = this.checks.get(unit);
-    if (check) check.checked = included;
-    this.updateCount();
+  /** 勾选 / 取消某一轮 */
+  private toggle(id: string, keys: string[], included: boolean) {
+    const { mode, marked } = this.selection;
+    // all 模式下 marked 是排除项，only 模式下是包含项
+    if (included === (mode === 'only')) marked.set(id, keys);
+    else for (const [k, group] of marked) if (k === id || group.some((x) => keys.includes(x))) marked.delete(k);
+    this.syncTurns();
   }
 
-  private select(predicate: (turn: Turn, index: number) => boolean) {
-    this.dom.turns.forEach((t, i) => this.setIncluded(t.unit, predicate(t, i)));
+  private setSelection(mode: TurnSelection['mode'], turns: ConversationDom['turns'] = []) {
+    this.selection = { mode, marked: new Map(turns.map((t) => [t.id, keysOf(t)])) };
+    this.syncTurns();
   }
 
-  private selectedTurns(): Turn[] {
-    return this.dom.turns.filter((t) => !this.excluded.has(t.unit));
+  /** 最后一轮：先滚到底部，确保拿到的是整段对话的最后一轮 */
+  private async selectLast() {
+    this.setBusy(true);
+    try {
+      await this.scrollToEnd();
+    } finally {
+      this.setBusy(false);
+    }
+    const turns = this.dom.turns;
+    const lastIndex = turns.length - 1;
+    // 新版页面每个单元已是一问一答（data-turn-key），只选最后一个；旧版按消息拆分时，从最后一条用户消息开始
+    const paired = !!turns[lastIndex]?.unit.querySelector('[data-turn-key]');
+    const lastUser = turns.map((t) => t.role).lastIndexOf('user');
+    const start = paired || lastUser < 0 ? Math.max(0, lastIndex) : lastUser;
+    this.setSelection('only', turns.slice(start));
+  }
+
+  private async scrollToEnd() {
+    const scroller = this.dom.turns.at(-1)?.unit;
+    scroller?.scrollIntoView({ block: 'end', behavior: 'instant' as ScrollBehavior });
+    for (let i = 0; i < 3; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      this.refresh();
+      this.dom.turns.at(-1)?.unit.scrollIntoView({ block: 'end', behavior: 'instant' as ScrollBehavior });
+    }
   }
 
   private updateCount() {
-    this.countEl.textContent = `${this.selectedTurns().length}/${this.dom.turns.length}`;
+    const n = this.selection.marked.size;
+    this.countEl.textContent =
+      this.selection.mode === 'all' ? (n ? `全部对话（排除 ${n} 轮）` : '全部对话') : `已选 ${n} 轮`;
   }
 
   /** 勾选框跟随页面滚动：放在每个轮次中消息内容的左侧 */
   private tick = () => {
-    for (const { unit } of this.dom.turns) {
-      const check = this.checks.get(unit);
+    for (const { id, unit } of this.dom.turns) {
+      const check = this.checks.get(id);
       if (!check) continue;
       const rect = boxOf(unit).getBoundingClientRect();
-      const msg = unit.querySelector('[data-message-author-role]')?.getBoundingClientRect();
+      const msg = unit.querySelector('[data-message-author-role], [data-user-message-bubble], [data-markdown-text-style]')?.getBoundingClientRect();
       const visible = rect.bottom > 0 && rect.top < innerHeight && rect.height > 0;
       check.style.display = visible ? '' : 'none';
       if (!visible) continue;
       const anchorLeft = msg && msg.width > 0 ? Math.min(msg.left, rect.left + rect.width / 2) : rect.left + 8;
       check.style.left = `${Math.max(rect.left + 4, anchorLeft - 34)}px`;
-      check.style.top = `${Math.max(rect.top + 8, Math.min((msg?.top ?? rect.top) + 4, rect.bottom - 30))}px`;
+      // 很高的轮次：勾选框吸附在视口内（顶部留出页头空间），不随内容滚出屏幕
+      const top = Math.max(rect.top + 8, (msg?.top ?? rect.top) + 4, 64);
+      check.style.top = `${Math.min(top, rect.bottom - 30, innerHeight - 30)}px`;
     }
     this.raf = requestAnimationFrame(this.tick);
   };
@@ -269,7 +307,9 @@ class SelectionMode {
 
   private async capture(): Promise<Blob[]> {
     this.refresh();
-    return captureTurns(this.dom, this.selectedTurns(), this.options, (text) => this.setStatus(text));
+    const { blobs, turnCount } = await captureConversation(this.selection, this.options, (text) => this.setStatus(text));
+    this.lastTurnCount = turnCount;
+    return blobs;
   }
 
   private baseName(): string {
@@ -289,12 +329,12 @@ class SelectionMode {
       }
       this.setStatus(
         blobs.length > 1
-          ? `对话较长，已切分为 ${blobs.length} 张图片保存到「下载/ChatGPT」目录。`
-          : '已保存到「下载/ChatGPT」目录。',
+          ? `共 ${this.lastTurnCount} 轮，较长，已切分为 ${blobs.length} 张图片保存到「下载/ChatGPT」目录。`
+          : `共 ${this.lastTurnCount} 轮，已保存到「下载/ChatGPT」目录。`,
       );
     } catch (err) {
       console.error('[ChatGPT Export]', err);
-      this.setStatus(err instanceof Error ? err.message : String(err), true);
+      this.setStatus(`导出失败：${err instanceof Error ? err.message : String(err)}`, true);
     } finally {
       this.setBusy(false);
     }
@@ -311,10 +351,10 @@ class SelectionMode {
         return blobs[0];
       });
       await navigator.clipboard.write([new ClipboardItem({ 'image/png': pngPromise })]);
-      this.setStatus('图片已复制到剪贴板。');
+      this.setStatus(`共 ${this.lastTurnCount} 轮，图片已复制到剪贴板。`);
     } catch (err) {
       console.error('[ChatGPT Export]', err);
-      this.setStatus(err instanceof Error ? err.message : String(err), true);
+      this.setStatus(`导出失败：${err instanceof Error ? err.message : String(err)}`, true);
     } finally {
       this.setBusy(false);
     }

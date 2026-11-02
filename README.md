@@ -32,15 +32,23 @@ npm run build:firefox / zip:firefox   # Firefox 版本
 | 按钮 | 说明 |
 |---|---|
 | 导出 Markdown | 直接下载 `标题_时间.md`。勾选「内嵌对话图片」时图片以 base64 写入文件（文件会变大）；不勾选时只保留占位说明。 |
-| 导出图片 | 页面进入选择模式：每轮对话左侧出现勾选框，底部出现工具栏（全选 / 全不选 / 最后一轮、清晰度 1x–3x、隐藏操作按钮、裁剪两侧空白），然后「下载 PNG」或「复制」。按 Esc 或「退出」恢复页面。 |
+| 导出图片 | 页面进入选择模式：底部出现工具栏（全选 / 全不选 / 最后一轮、清晰度 1x–3x、隐藏操作按钮、裁剪两侧空白），然后「下载 PNG」或「复制」。默认导出整段对话（包括尚未加载的历史）；取消某轮左侧的勾选即排除该轮，点「全不选」后再勾选则只导出勾选的轮次。按 Esc 或「退出」恢复页面。 |
 
 ### 图片导出的实现
 
-ChatGPT 的对话列表是**虚拟滚动**的：每轮对话外层是一个 `div[data-turn-id-container]` 占位，只有滚动到视口附近才会渲染真正的内容（`section[data-testid="conversation-turn-N"]`）。因此导出流程是：
+ChatGPT 的对话列表是**虚拟滚动**的，目前有两种形态：
 
-1. 逐个把选中的轮次滚动到视口，等 ChatGPT 渲染完成、图片加载完、高度稳定；
-2. 用 [modern-screenshot](https://github.com/qq15725/modern-screenshot) 截取该轮次的真实 DOM（SVG foreignObject，由浏览器自己绘制，支持 oklch 等现代 CSS）；跨域图片由后台脚本代为下载，避免 CORS 导致空白；
-3. 按页面中的真实间距把各轮次拼接成长图，恢复原来的滚动位置。
+- 2026 版：滑动窗口，只挂载视口附近的约 7 轮（`div[data-turn-key]`，一问一答为一轮），窗口外的轮次没有任何 DOM 节点；滚动到顶部时才懒加载更早的历史，并可能重新分组。
+- 2025 版：每轮都有占位容器 `div[data-turn-id-container]`，只在视口附近渲染内容。
+
+因此导出流程是：
+
+1. 滚动到顶部，直到不再加载更早的历史；
+2. 自上而下逐屏滚动，按消息 ID（`data-chatgpt-search-message-ids` 等）去重，等每个选中的轮次渲染完成、图片加载完；
+3. 用 [modern-screenshot](https://github.com/qq15725/modern-screenshot) 截取该轮次的真实 DOM（SVG foreignObject，由浏览器自己绘制）。跨域图片（`images.openai.com`、引用来源的网站图标等）由后台脚本代为下载，避免 CORS 导致空白。每轮截完立即压缩成 PNG，避免长对话占用大量内存；
+4. 按页面中的真实间距拼接成长图，最后回到原来的阅读位置。
+
+只选择了当前屏幕附近的轮次时，跳过第 1、2 步直接截图。
 
 浏览器单个 canvas 的高度上限约 32767px，超出时按轮次边界自动切分成多张（`_1of2.png` …），保存在下载目录的 `ChatGPT/` 子文件夹中。图片导出也支持 `chatgpt.com/share/...` 分享页。
 
@@ -66,6 +74,6 @@ public/icon/                  # 插件图标
 
 - 只导出当前对话中 user / assistant 的可见文本和图片；代码解释器的执行过程、推理过程等工具消息不导出（生成的图片会保留）。
 - Markdown 依赖 ChatGPT 的非公开接口，接口变化时需要调整 `entrypoints/content/api.ts` 和 `utils/conversation.ts`。
-- 图片依赖 ChatGPT 页面的 DOM 结构（`data-turn-id-container`、`data-testid="conversation-turn-N"`、`data-turn`、`data-message-author-role`、`*-turn-action-button`），页面改版时需要调整 `entrypoints/content/capture.ts`。
-- 截图时页面会快速滚动一遍选中的轮次，结束后恢复原位置；对话很长时需要几秒到几十秒。
+- 图片依赖 ChatGPT 页面的 DOM 结构（`data-turn-key`、`data-conversation-role`、`data-chatgpt-search-message-ids`、`.turn-action-controls`，以及旧版的 `data-turn-id-container`、`data-message-author-role` 等），页面改版时需要调整 `entrypoints/content/capture.ts`。识别失败时弹窗会显示各类节点的数量，便于排查。
+- 导出整段对话时页面会滚动一遍完整历史，较慢：实测 14 轮约 4–5 分钟，原因尚未查明。只导出当前屏幕附近的几轮时很快（每轮约 2 秒）。
 - Team / Enterprise 工作区通过 `_account` cookie 识别，若请求返回 404 请先在页面中切换到对应工作区。
