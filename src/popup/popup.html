@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <title>ChatGPT 对话导出</title>
+    <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+    <header>
+        <img src="../../icons/icon48.png" alt="" width="24" height="24">
+        <h1>ChatGPT 对话导出</h1>
+    </header>
+
+    <p id="target" class="target">正在检测当前页面…</p>
+
+    <div class="actions">
+        <button id="btn-md" class="btn primary" disabled>
+            <span class="btn-title">导出 Markdown</span>
+            <span class="btn-sub">下载 .md 文件</span>
+        </button>
+        <button id="btn-img" class="btn" disabled>
+            <span class="btn-title">导出图片</span>
+            <span class="btn-sub">打开预览，挑选消息后下载 PNG</span>
+        </button>
+    </div>
+
+    <label class="option">
+        <input type="checkbox" id="opt-embed" checked>
+        <span>Markdown 中以 base64 内嵌对话图片</span>
+    </label>
+
+    <p id="status" class="status" role="status"></p>
+
+    <script src="popup.js"></script>
+</body>
+</html>
